@@ -5,12 +5,39 @@ import os
 import subprocess
 import time
 from datetime import datetime, timezone
+from math import sqrt
 
 import requests
 
 
 def _run(cmd: list[str], timeout: int = 20) -> str:
     return subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=timeout, text=True)
+
+
+def _env_float(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except Exception:
+        return None
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
 
 
 def scan_wifi() -> list[dict]:
@@ -95,37 +122,130 @@ def _freq_to_channel(freq_mhz: int) -> int | None:
     return None
 
 
-def ping_latency_ms(host: str = "8.8.8.8") -> float | None:
+def ping_stats_ms(host: str = "8.8.8.8", *, count: int = 4, timeout_s: int = 20) -> dict | None:
     try:
-        out = _run(["ping", "-c", "4", "-n", host], timeout=20)
-        # rtt min/avg/max/mdev = 7.123/8.456/9.001/0.321 ms
-        for line in out.splitlines():
-            if "min/avg" in line and "=" in line:
-                stats = line.split("=")[1].strip().split()[0]
-                min_s, avg_s, max_s, mdev_s = stats.split("/")
-                return float(avg_s)
+        out = _run(["ping", "-c", str(count), "-n", host], timeout=timeout_s)
     except Exception:
         return None
-    return None
+
+    # Common formats:
+    # - rtt min/avg/max/mdev = 7.123/8.456/9.001/0.321 ms
+    # - round-trip min/avg/max/stddev = 7.123/8.456/9.001/0.321 ms
+    for line in out.splitlines():
+        if ("min/avg" in line) and ("=" in line):
+            try:
+                stats = line.split("=", 1)[1].strip().split()[0]
+                _min_s, avg_s, _max_s, dev_s = stats.split("/")
+                return {"ping_ms": float(avg_s), "jitter_ms": float(dev_s)}
+            except Exception:
+                pass
+
+    # Fallback: compute avg + stddev from per-packet times.
+    samples: list[float] = []
+    for line in out.splitlines():
+        # e.g. "64 bytes from 8.8.8.8: icmp_seq=1 ttl=116 time=8.42 ms"
+        if " time=" not in line:
+            continue
+        try:
+            tail = line.split(" time=", 1)[1]
+            value = float(tail.split()[0])
+            samples.append(value)
+        except Exception:
+            continue
+
+    if not samples:
+        return None
+
+    avg = sum(samples) / len(samples)
+    var = sum((x - avg) ** 2 for x in samples) / len(samples)
+    return {"ping_ms": float(avg), "jitter_ms": float(sqrt(var))}
 
 
-def run_speedtest() -> dict | None:
+def run_speedtest_cli(*, timeout_s: int = 120) -> dict | None:
     try:
-        import speedtest
+        out = _run(["speedtest-cli", "--json", "--secure"], timeout=timeout_s)
+    except Exception:
+        return None
 
-        st = speedtest.Speedtest()
-        st.get_best_server()
-        down_bps = st.download()
-        up_bps = st.upload()
-        ping_ms = float(st.results.ping)
+    # Some environments prepend warnings; try to extract JSON object.
+    text = out.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
 
+    try:
+        data = json.loads(text[start : end + 1])
+        download_bps = float(data.get("download"))
+        upload_bps = float(data.get("upload"))
+        ping_ms = float(data.get("ping"))
         return {
-            "download_mbps": down_bps / 1e6,
-            "upload_mbps": up_bps / 1e6,
+            "download_mbps": download_bps / 1e6,
+            "upload_mbps": upload_bps / 1e6,
             "ping_ms": ping_ms,
         }
     except Exception:
         return None
+
+
+def location_from_env() -> dict | None:
+    lat = _env_float("LOCATION_LAT")
+    lon = _env_float("LOCATION_LON")
+    if lat is None or lon is None:
+        return None
+    loc: dict = {"lat": lat, "lon": lon}
+    acc = _env_float("LOCATION_ACCURACY_M")
+    if acc is not None:
+        loc["accuracy_m"] = acc
+    label = os.getenv("LOCATION_LABEL")
+    if label:
+        loc["label"] = label.strip()
+    return loc
+
+
+def location_from_gpsd(*, timeout_s: int = 6) -> dict | None:
+    # Requires gpsd + gpspipe. Returns the first TPV fix that includes lat/lon.
+    try:
+        out = _run(["gpspipe", "-w", "-n", "12"], timeout=timeout_s)
+    except Exception:
+        return None
+
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("class") != "TPV":
+            continue
+        lat = obj.get("lat")
+        lon = obj.get("lon")
+        if lat is None or lon is None:
+            continue
+
+        loc: dict = {"lat": float(lat), "lon": float(lon)}
+
+        # gpsd uses meters for epx/epy/eph.
+        for key in ("eph", "epx", "epy"):
+            if obj.get(key) is None:
+                continue
+            try:
+                loc["accuracy_m"] = float(obj[key])
+                break
+            except Exception:
+                pass
+
+        return loc
+
+    return None
+
+
+def get_location(*, gpsd_enabled: bool = True) -> dict | None:
+    return location_from_env() or (location_from_gpsd() if gpsd_enabled else None)
 
 
 def main() -> None:
@@ -135,6 +255,21 @@ def main() -> None:
 
     connect_timeout_s = float(os.getenv("HTTP_CONNECT_TIMEOUT", "5"))
     read_timeout_s = float(os.getenv("HTTP_READ_TIMEOUT", "15"))
+
+    ping_host = os.getenv("PING_HOST", "8.8.8.8")
+    ping_count = _env_int("PING_COUNT") or 4
+    ping_timeout_s = _env_int("PING_TIMEOUT_SECONDS") or 20
+
+    speedtest_enabled = (os.getenv("SPEEDTEST_ENABLED", "1").strip() not in {"0", "false", "no"})
+    speedtest_interval_s = _env_int("SPEEDTEST_INTERVAL_SECONDS") or 600
+    speedtest_timeout_s = _env_int("SPEEDTEST_TIMEOUT_SECONDS") or 120
+
+    gpsd_enabled = (os.getenv("GPSD_ENABLED", "1").strip() not in {"0", "false", "no"})
+    location_interval_s = _env_int("LOCATION_INTERVAL_SECONDS") or 300
+
+    last_speedtest_at = 0.0
+    last_location_at = 0.0
+    cached_location: dict | None = None
 
     # Preflight: helps distinguish "backend not reachable" vs "ingest is slow".
     try:
@@ -147,24 +282,47 @@ def main() -> None:
         ts = datetime.now(timezone.utc).isoformat()
         wifi = scan_wifi()
 
-        speed = None
-        st = run_speedtest()
-        if st:
-            # Jitter not provided by speedtest-cli; keep 0 and use ping jitter in web.
+        # Location: cache it so we don't hammer gpsd every loop.
+        now = time.time()
+        if (cached_location is None) or (now - last_location_at >= location_interval_s):
+            cached_location = get_location(gpsd_enabled=gpsd_enabled)
+            last_location_at = now
+
+        # Always try to capture ping (avg + jitter).
+        ping = ping_stats_ms(ping_host, count=ping_count, timeout_s=ping_timeout_s)
+
+        speedtest = None
+        if speedtest_enabled and (now - last_speedtest_at >= speedtest_interval_s):
+            speedtest = run_speedtest_cli(timeout_s=speedtest_timeout_s)
+            last_speedtest_at = now
+
+        # backend_js expects speed to always contain throughput fields.
+        speed: dict | None = None
+        if ping is not None:
             speed = {
-                "download_mbps": float(st["download_mbps"]),
-                "upload_mbps": float(st["upload_mbps"]),
-                "ping_ms": float(st["ping_ms"]),
+                "download_mbps": 0.0,
+                "upload_mbps": 0.0,
+                "ping_ms": float(ping["ping_ms"]),
+                "jitter_ms": float(ping["jitter_ms"]),
+            }
+        elif speedtest is not None:
+            # If ICMP ping is blocked, at least store speedtest ping.
+            speed = {
+                "download_mbps": 0.0,
+                "upload_mbps": 0.0,
+                "ping_ms": float(speedtest["ping_ms"]),
                 "jitter_ms": 0.0,
             }
-        else:
-            lat = ping_latency_ms()
-            if lat is not None:
-                speed = {"download_mbps": 0.0, "upload_mbps": 0.0, "ping_ms": float(lat), "jitter_ms": 0.0}
 
-        payload = {"device_id": device_id, "ts": ts, "wifi": wifi}
+        if speedtest is not None and speed is not None:
+            speed["download_mbps"] = float(speedtest["download_mbps"])
+            speed["upload_mbps"] = float(speedtest["upload_mbps"])
+
+        payload: dict = {"device_id": device_id, "ts": ts, "wifi": wifi}
         if speed is not None:
             payload["speed"] = speed
+        if cached_location is not None:
+            payload["location"] = cached_location
 
         try:
             r = requests.post(
@@ -173,7 +331,12 @@ def main() -> None:
                 timeout=(connect_timeout_s, read_timeout_s),
             )
             r.raise_for_status()
-            print(f"[{ts}] sent ok: wifi={len(wifi)} speed={'yes' if speed else 'no'}")
+            kind = "none"
+            if speed is not None:
+                kind = "throughput" if (speed.get("download_mbps", 0.0) > 0 or speed.get("upload_mbps", 0.0) > 0) else "ping"
+            print(
+                f"[{ts}] sent ok: wifi={len(wifi)} speed={kind} location={'yes' if cached_location else 'no'}"
+            )
         except Exception as e:
             print(
                 f"[{ts}] send failed (api_base={api_base} connect_timeout={connect_timeout_s}s read_timeout={read_timeout_s}s): {e}"
