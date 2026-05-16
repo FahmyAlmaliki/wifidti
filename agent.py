@@ -129,9 +129,19 @@ def run_speedtest() -> dict | None:
 
 
 def main() -> None:
-    api_base = os.getenv("API_BASE", "http://localhost:8000").rstrip("/")
+    api_base = os.getenv("API_BASE", "http://10.39.30.150:8000").rstrip("/")
     device_id = os.getenv("DEVICE_ID", "pi-01")
     interval_s = int(os.getenv("INTERVAL_SECONDS", "60"))
+
+    connect_timeout_s = float(os.getenv("HTTP_CONNECT_TIMEOUT", "5"))
+    read_timeout_s = float(os.getenv("HTTP_READ_TIMEOUT", "15"))
+
+    # Preflight: helps distinguish "backend not reachable" vs "ingest is slow".
+    try:
+        r = requests.get(f"{api_base}/api/health", timeout=(min(connect_timeout_s, 5.0), min(read_timeout_s, 5.0)))
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[startup] backend health check failed ({api_base}/api/health): {e}")
 
     while True:
         ts = datetime.now(timezone.utc).isoformat()
@@ -157,11 +167,17 @@ def main() -> None:
             payload["speed"] = speed
 
         try:
-            r = requests.post(f"{api_base}/api/ingest/pi", json=payload, timeout=15)
+            r = requests.post(
+                f"{api_base}/api/ingest/pi",
+                json=payload,
+                timeout=(connect_timeout_s, read_timeout_s),
+            )
             r.raise_for_status()
             print(f"[{ts}] sent ok: wifi={len(wifi)} speed={'yes' if speed else 'no'}")
         except Exception as e:
-            print(f"[{ts}] send failed: {e}")
+            print(
+                f"[{ts}] send failed (api_base={api_base} connect_timeout={connect_timeout_s}s read_timeout={read_timeout_s}s): {e}"
+            )
 
         time.sleep(interval_s)
 
