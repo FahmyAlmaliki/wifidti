@@ -161,31 +161,74 @@ def ping_stats_ms(host: str = "8.8.8.8", *, count: int = 4, timeout_s: int = 20)
     return {"ping_ms": float(avg), "jitter_ms": float(sqrt(var))}
 
 
-def run_speedtest_cli(*, timeout_s: int = 120) -> dict | None:
-    try:
-        out = _run(["speedtest-cli", "--json", "--secure"], timeout=timeout_s)
-    except Exception:
-        return None
+def run_speedtest_cli(*, timeout_s: int = 120) -> tuple[dict | None, str | None]:
+    cmds = [
+        ["speedtest-cli", "--json", "--secure"],
+        ["speedtest", "--json", "--secure"],
+    ]
 
-    # Some environments prepend warnings; try to extract JSON object.
-    text = out.strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
+    last_err: str | None = None
+    for cmd in cmds:
+        try:
+            out = _run(cmd, timeout=timeout_s)
+        except FileNotFoundError:
+            last_err = f"{cmd[0]} not found"
+            continue
+        except subprocess.CalledProcessError as e:
+            text = (getattr(e, "output", "") or "").strip()
+            last_err = f"{cmd[0]} exit {e.returncode}: {text[-400:]}" if text else f"{cmd[0]} exit {e.returncode}"
+            continue
+        except Exception as e:
+            last_err = f"{cmd[0]} failed: {e}"
+            continue
 
+        # Some environments prepend warnings; try to extract JSON object.
+        text = out.strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            last_err = f"{cmd[0]} returned non-JSON output"
+            continue
+
+        try:
+            data = json.loads(text[start : end + 1])
+            download_bps = float(data.get("download"))
+            upload_bps = float(data.get("upload"))
+            ping_ms = float(data.get("ping"))
+            return (
+                {
+                    "download_mbps": download_bps / 1e6,
+                    "upload_mbps": upload_bps / 1e6,
+                    "ping_ms": ping_ms,
+                },
+                None,
+            )
+        except Exception as e:
+            last_err = f"{cmd[0]} JSON parse failed: {e}"
+            continue
+
+    return None, last_err
+
+
+def run_speedtest_lib() -> tuple[dict | None, str | None]:
     try:
-        data = json.loads(text[start : end + 1])
-        download_bps = float(data.get("download"))
-        upload_bps = float(data.get("upload"))
-        ping_ms = float(data.get("ping"))
-        return {
-            "download_mbps": download_bps / 1e6,
-            "upload_mbps": upload_bps / 1e6,
-            "ping_ms": ping_ms,
-        }
-    except Exception:
-        return None
+        import speedtest  # type: ignore
+
+        st = speedtest.Speedtest()
+        st.get_best_server()
+        down_bps = st.download()
+        up_bps = st.upload()
+        ping_ms = float(st.results.ping)
+        return (
+            {
+                "download_mbps": down_bps / 1e6,
+                "upload_mbps": up_bps / 1e6,
+                "ping_ms": ping_ms,
+            },
+            None,
+        )
+    except Exception as e:
+        return None, str(e)
 
 
 def location_from_env() -> dict | None:
@@ -292,31 +335,28 @@ def main() -> None:
         ping = ping_stats_ms(ping_host, count=ping_count, timeout_s=ping_timeout_s)
 
         speedtest = None
+        speedtest_err = None
         if speedtest_enabled and (now - last_speedtest_at >= speedtest_interval_s):
-            speedtest = run_speedtest_cli(timeout_s=speedtest_timeout_s)
+            speedtest, speedtest_err = run_speedtest_cli(timeout_s=speedtest_timeout_s)
+            if speedtest is None:
+                speedtest, lib_err = run_speedtest_lib()
+                if speedtest is None and lib_err:
+                    speedtest_err = (speedtest_err or "") + ("; " if speedtest_err else "") + f"lib: {lib_err}"
+
             last_speedtest_at = now
 
-        # backend_js expects speed to always contain throughput fields.
         speed: dict | None = None
         if ping is not None:
-            speed = {
-                "download_mbps": 0.0,
-                "upload_mbps": 0.0,
-                "ping_ms": float(ping["ping_ms"]),
-                "jitter_ms": float(ping["jitter_ms"]),
-            }
+            speed = {"ping_ms": float(ping["ping_ms"]), "jitter_ms": float(ping["jitter_ms"])}
         elif speedtest is not None:
             # If ICMP ping is blocked, at least store speedtest ping.
-            speed = {
-                "download_mbps": 0.0,
-                "upload_mbps": 0.0,
-                "ping_ms": float(speedtest["ping_ms"]),
-                "jitter_ms": 0.0,
-            }
+            speed = {"ping_ms": float(speedtest["ping_ms"]), "jitter_ms": 0.0}
 
         if speedtest is not None and speed is not None:
             speed["download_mbps"] = float(speedtest["download_mbps"])
             speed["upload_mbps"] = float(speedtest["upload_mbps"])
+        elif speedtest_err:
+            print(f"[{ts}] speedtest failed: {speedtest_err}")
 
         payload: dict = {"device_id": device_id, "ts": ts, "wifi": wifi}
         if speed is not None:
@@ -333,7 +373,7 @@ def main() -> None:
             r.raise_for_status()
             kind = "none"
             if speed is not None:
-                kind = "throughput" if (speed.get("download_mbps", 0.0) > 0 or speed.get("upload_mbps", 0.0) > 0) else "ping"
+                kind = "throughput" if (speed.get("download_mbps") is not None or speed.get("upload_mbps") is not None) else "ping"
             print(
                 f"[{ts}] sent ok: wifi={len(wifi)} speed={kind} location={'yes' if cached_location else 'no'}"
             )
