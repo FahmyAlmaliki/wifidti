@@ -129,7 +129,7 @@ def run_speedtest() -> dict | None:
 
 
 def main() -> None:
-    api_base = os.getenv("API_BASE", "http://10.39.30.150:8000").rstrip("/")
+    api_base = os.getenv("API_BASE", "http://localhost:8000").rstrip("/")
     device_id = os.getenv("DEVICE_ID", "pi-01")
     interval_s = int(os.getenv("INTERVAL_SECONDS", "60"))
 
