@@ -304,7 +304,8 @@ def main() -> None:
     ping_timeout_s = _env_int("PING_TIMEOUT_SECONDS") or 20
 
     speedtest_enabled = (os.getenv("SPEEDTEST_ENABLED", "1").strip() not in {"0", "false", "no"})
-    speedtest_interval_s = _env_int("SPEEDTEST_INTERVAL_SECONDS") or 600
+    # Default: run a full test every loop so dashboard shows download/upload too.
+    speedtest_interval_s = _env_int("SPEEDTEST_INTERVAL_SECONDS") or interval_s
     speedtest_timeout_s = _env_int("SPEEDTEST_TIMEOUT_SECONDS") or 120
 
     gpsd_enabled = (os.getenv("GPSD_ENABLED", "1").strip() not in {"0", "false", "no"})
