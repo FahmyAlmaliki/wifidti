@@ -294,6 +294,8 @@ def get_location(*, gpsd_enabled: bool = True) -> dict | None:
 def main() -> None:
     api_base = os.getenv("API_BASE", "http://localhost:8000").rstrip("/")
     device_id = os.getenv("DEVICE_ID", "pi-01")
+    source = os.getenv("SOURCE", "pi").strip() or "pi"
+    test = os.getenv("TEST", "raspi").strip() or "raspi"
     interval_s = int(os.getenv("INTERVAL_SECONDS", "60"))
 
     connect_timeout_s = float(os.getenv("HTTP_CONNECT_TIMEOUT", "5"))
@@ -359,7 +361,7 @@ def main() -> None:
         elif speedtest_err:
             print(f"[{ts}] speedtest failed: {speedtest_err}")
 
-        payload: dict = {"device_id": device_id, "ts": ts, "wifi": wifi}
+        payload: dict = {"device_id": device_id, "source": source, "test": test, "ts": ts, "wifi": wifi}
         if speed is not None:
             payload["speed"] = speed
         if cached_location is not None:
